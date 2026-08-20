@@ -26,8 +26,9 @@ ENV VIRTUAL_ENV=/app/.venv
 RUN uv venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Install mcpo (assuming pyproject.toml is properly configured)
-RUN uv pip install . && rm -rf ~/.cache
+# Install mcpo from the lockfile so Docker does not pull MCP SDK v2
+# (v2 removed streamablehttp_client, which this codebase still uses).
+RUN uv sync --frozen --no-dev && rm -rf ~/.cache
 
 # Verify mcpo installed correctly
 RUN which mcpo

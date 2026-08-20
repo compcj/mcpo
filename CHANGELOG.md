@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.22] - 2026-08-20
+
+### Fixed
+
+* **Docker image ImportError for `streamablehttp_client`**: The image used `uv pip install .`, which resolved the unpinned `mcp>=1.17.0` dependency to MCP SDK v2. That release removed `streamablehttp_client`. Pin `mcp` to `>=1.17.0,<2` and install with `uv sync --frozen` so the image stays on the v1 client API.
+
 ## [0.0.21] - 2026-08-20
 
 ### Added
