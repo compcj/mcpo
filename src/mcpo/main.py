@@ -529,7 +529,7 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
 
     for tool in tools:
         endpoint_name = tool.name
-        endpoint_description = tool.description
+        endpoint_description = tool.description or ""
 
         inputSchema = tool.inputSchema
         outputSchema = getattr(tool, "outputSchema", None)
@@ -562,13 +562,45 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
             client_header_forwarding_config,
         )
 
-        app.post(
-            f"/{endpoint_name}",
-            summary=endpoint_name.replace("_", " ").title(),
-            description=endpoint_description,
-            response_model_exclude_none=True,
-            dependencies=[Depends(api_dependency)] if api_dependency else [],
-        )(tool_handler)
+        annotations = getattr(tool, "annotations", None)
+        openapi_extra = None
+        tags = None
+        if annotations is not None:
+            # MCP ToolAnnotations may be a pydantic model; normalize to a dict
+            if hasattr(annotations, "model_dump"):
+                annotations_dict = annotations.model_dump(exclude_none=True)
+            elif isinstance(annotations, dict):
+                annotations_dict = {k: v for k, v in annotations.items() if v is not None}
+            else:
+                annotations_dict = {}
+
+            if annotations_dict:
+                openapi_extra = {"x-mcp-annotations": annotations_dict}
+
+                if annotations_dict.get("destructiveHint"):
+                    warning = (
+                        "\n\n**Warning:** This tool is marked destructive "
+                        "(destructiveHint). It may have irreversible side effects "
+                        "(for example, spending money or modifying remote state). "
+                        "Confirm with the user before calling."
+                    )
+                    endpoint_description = f"{endpoint_description}{warning}"
+                    tags = ["destructive"]
+                elif annotations_dict.get("readOnlyHint"):
+                    tags = ["read-only"]
+
+        post_kwargs = {
+            "summary": endpoint_name.replace("_", " ").title(),
+            "description": endpoint_description,
+            "response_model_exclude_none": True,
+            "dependencies": [Depends(api_dependency)] if api_dependency else [],
+        }
+        if openapi_extra is not None:
+            post_kwargs["openapi_extra"] = openapi_extra
+        if tags is not None:
+            post_kwargs["tags"] = tags
+
+        app.post(f"/{endpoint_name}", **post_kwargs)(tool_handler)
 
 
 @asynccontextmanager

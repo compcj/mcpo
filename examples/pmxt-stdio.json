@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pmxt": {
+      "command": "npx",
+      "args": ["-y", "@pmxt/mcp"],
+      "env": {
+        "PMXT_API_KEY": "pmxt_live_YOUR_KEY_HERE"
+      }
+    }
+  }
+}

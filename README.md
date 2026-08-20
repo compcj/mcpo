@@ -140,6 +140,30 @@ Each tool will be accessible under its own unique route, e.g.:
 
 Each with a dedicated OpenAPI schema and proxy handler. Access full schema UI at: `http://localhost:8000/<tool>/docs`  (e.g. /memory/docs, /time/docs)
 
+### 📈 Example: [@pmxt/mcp](https://github.com/pmxt-dev/pmxt-mcp) (prediction markets)
+
+mcpo works with any MCP server. [@pmxt/mcp](https://github.com/pmxt-dev/pmxt-mcp) exposes the [PMXT](https://pmxt.dev) unified prediction-market API (Polymarket, Kalshi, Limitless, and more) as tools.
+
+Get an API key at [pmxt.dev/dashboard](https://pmxt.dev/dashboard), put it in the example config, then:
+
+```bash
+# stdio (local MCP process via npx)
+mcpo --config examples/pmxt-stdio.json --port 8000
+
+# hosted Streamable HTTP
+mcpo --config examples/pmxt-http.json --port 8000
+```
+
+Tools are available under `/pmxt/...`, for example:
+
+- Interactive docs: http://localhost:8000/pmxt/docs
+- Discovery: `POST /pmxt/fetchEvents`
+- Quotes: `POST /pmxt/fetchOrderBook`
+
+Every tool requires an `exchange` parameter (enum values such as `polymarket`, `kalshi`, `limitless`). OpenAPI schemas preserve those enums so clients and LLMs see allowed venues.
+
+**Trading tools** (`createOrder`, `submitOrder`, `cancelOrder`) are marked destructive in OpenAPI (`x-mcp-annotations` / `destructive` tag). They can spend real money—confirm with the user before calling.
+
 ### 🔐 OAuth 2.1 Authentication
 
 mcpo supports OAuth 2.1 authentication for MCP servers that require it. The implementation defaults to **dynamic client registration**, so most servers only need minimal configuration:

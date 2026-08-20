@@ -1,8 +1,8 @@
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 from typing import Any, List, Dict, Union
 
-from mcpo.utils.main import _process_schema_property
+from mcpo.utils.main import _process_schema_property, get_model_fields
 
 
 _model_cache = {}
@@ -84,6 +84,107 @@ def test_process_unknown_type():
     )
     assert result_type == expected_type
     assert result_field.default == expected_field.default
+
+
+def test_process_string_enum_preserves_schema():
+    schema = {
+        "type": "string",
+        "enum": ["title", "author", "date"],
+        "description": "Sort field",
+    }
+    result_type, result_field = _process_schema_property(
+        _model_cache, schema, "test", "sort_by", True
+    )
+
+    model = create_model("EnumSchemaModel", sort_by=(result_type, result_field))
+    sort_by_schema = model.model_json_schema()["properties"]["sort_by"]
+
+    assert sort_by_schema["enum"] == ["title", "author", "date"]
+    assert sort_by_schema["type"] == "string"
+    assert sort_by_schema["description"] == "Sort field"
+
+
+def test_process_pmxt_exchange_enum():
+    exchange_values = [
+        "polymarket",
+        "kalshi",
+        "kalshi-demo",
+        "limitless",
+        "probable",
+        "baozi",
+        "myriad",
+        "opinion",
+        "metaculus",
+        "smarkets",
+        "polymarket_us",
+        "gemini-titan",
+        "hyperliquid",
+        "suibets",
+        "rain",
+        "hunch",
+        "mock",
+        "router",
+    ]
+    schema = {
+        "type": "string",
+        "enum": exchange_values,
+        "description": "The prediction market exchange to target.",
+    }
+    result_type, result_field = _process_schema_property(
+        _model_cache, schema, "test", "exchange", True
+    )
+
+    model = create_model("PmxtExchangeModel", exchange=(result_type, result_field))
+    exchange_schema = model.model_json_schema()["properties"]["exchange"]
+
+    assert exchange_schema["enum"] == exchange_values
+    assert exchange_schema["type"] == "string"
+
+
+def test_process_pmxt_order_type_and_credentials():
+    """PMXT buildOrder/createOrder use a property named 'type' and nested credentials."""
+    properties = {
+        "exchange": {
+            "type": "string",
+            "enum": ["polymarket", "kalshi", "limitless"],
+            "description": "The prediction market exchange to target.",
+        },
+        "type": {
+            "type": "string",
+            "enum": ["market", "limit"],
+            "description": "Order type: market or limit.",
+        },
+        "credentials": {
+            "type": "object",
+            "description": "Venue credentials.",
+            "properties": {
+                "apiKey": {"type": "string"},
+                "privateKey": {"type": "string"},
+            },
+        },
+    }
+    model_fields = get_model_fields(
+        "createOrder_form_model",
+        properties,
+        required_fields=["exchange", "type"],
+    )
+    FormModel = create_model("CreateOrderFormModel", **model_fields)
+    schema = FormModel.model_json_schema()
+
+    assert schema["properties"]["exchange"]["enum"] == [
+        "polymarket",
+        "kalshi",
+        "limitless",
+    ]
+    assert schema["properties"]["type"]["enum"] == ["market", "limit"]
+    assert "credentials" in schema["properties"]
+    creds = schema["properties"]["credentials"]
+    # Nested object may be inlined or $ref'd
+    if "$ref" in creds:
+        ref_name = creds["$ref"].split("/")[-1]
+        creds = schema["$defs"][ref_name]
+    assert "apiKey" in creds["properties"]
+    assert "privateKey" in creds["properties"]
 
 
 def test_process_array_of_strings():
@@ -306,7 +407,13 @@ def test_multi_type_property_with_any_of():
     assert len(result_type.__args__) == 3
     assert len(result_type.__args__[0].model_fields) == 2
     assert len(result_type.__args__[1].model_fields) == 1
-    assert result_type.__args__[2] is str
+    enum_choice_model = create_model(
+        "AnyOfEnumChoiceModel",
+        value=(result_type.__args__[2], Field(default=...)),
+    )
+    enum_choice_schema = enum_choice_model.model_json_schema()["properties"]["value"]
+    assert enum_choice_schema["enum"] == ["auto", "none"]
+    assert enum_choice_schema["type"] == "string"
 
     # assert result_field parameter config
     assert result_field.description == "A property with multiple types"

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pmxt": {
+      "type": "streamable-http",
+      "url": "https://api.pmxt.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer pmxt_live_YOUR_KEY_HERE"
+      }
+    }
+  }
+}
