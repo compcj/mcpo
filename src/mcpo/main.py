@@ -24,6 +24,7 @@ from mcpo.utils.main import (
     get_model_fields,
     get_tool_handler,
     normalize_server_type,
+    collect_schema_defs,
 )
 from mcpo.utils.config_watcher import ConfigWatcher
 from mcpo.utils.headers import validate_client_header_forwarding_config
@@ -529,78 +530,86 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
 
     for tool in tools:
         endpoint_name = tool.name
-        endpoint_description = tool.description or ""
+        try:
+            endpoint_description = tool.description or ""
 
-        inputSchema = tool.inputSchema
-        outputSchema = getattr(tool, "outputSchema", None)
+            inputSchema = tool.inputSchema or {}
+            outputSchema = getattr(tool, "outputSchema", None)
 
-        form_model_fields = get_model_fields(
-            f"{endpoint_name}_form_model",
-            inputSchema.get("properties", {}),
-            inputSchema.get("required", []),
-            inputSchema.get("$defs", {}),
-        )
-
-        response_model_fields = None
-        if outputSchema:
-            response_model_fields = get_model_fields(
-                f"{endpoint_name}_response_model",
-                outputSchema.get("properties", {}),
-                outputSchema.get("required", []),
-                outputSchema.get("$defs", {}),
+            form_model_fields = get_model_fields(
+                f"{endpoint_name}_form_model",
+                inputSchema.get("properties", {}),
+                inputSchema.get("required", []),
+                collect_schema_defs(inputSchema),
             )
 
-        # Get client header forwarding configuration from app state
-        client_header_forwarding_config = getattr(
-            app.state, "client_header_forwarding", {"enabled": False}
-        )
+            response_model_fields = None
+            if outputSchema:
+                response_model_fields = get_model_fields(
+                    f"{endpoint_name}_response_model",
+                    outputSchema.get("properties", {}),
+                    outputSchema.get("required", []),
+                    collect_schema_defs(outputSchema),
+                )
 
-        tool_handler = get_tool_handler(
-            endpoint_name,
-            form_model_fields,
-            response_model_fields,
-            client_header_forwarding_config,
-        )
+            # Get client header forwarding configuration from app state
+            client_header_forwarding_config = getattr(
+                app.state, "client_header_forwarding", {"enabled": False}
+            )
 
-        annotations = getattr(tool, "annotations", None)
-        openapi_extra = None
-        tags = None
-        if annotations is not None:
-            # MCP ToolAnnotations may be a pydantic model; normalize to a dict
-            if hasattr(annotations, "model_dump"):
-                annotations_dict = annotations.model_dump(exclude_none=True)
-            elif isinstance(annotations, dict):
-                annotations_dict = {k: v for k, v in annotations.items() if v is not None}
-            else:
-                annotations_dict = {}
+            tool_handler = get_tool_handler(
+                endpoint_name,
+                form_model_fields,
+                response_model_fields,
+                client_header_forwarding_config,
+            )
 
-            if annotations_dict:
-                openapi_extra = {"x-mcp-annotations": annotations_dict}
+            annotations = getattr(tool, "annotations", None)
+            openapi_extra = None
+            tags = None
+            if annotations is not None:
+                # MCP ToolAnnotations may be a pydantic model; normalize to a dict
+                if hasattr(annotations, "model_dump"):
+                    annotations_dict = annotations.model_dump(exclude_none=True)
+                elif isinstance(annotations, dict):
+                    annotations_dict = {
+                        k: v for k, v in annotations.items() if v is not None
+                    }
+                else:
+                    annotations_dict = {}
 
-                if annotations_dict.get("destructiveHint"):
-                    warning = (
-                        "\n\n**Warning:** This tool is marked destructive "
-                        "(destructiveHint). It may have irreversible side effects "
-                        "(for example, spending money or modifying remote state). "
-                        "Confirm with the user before calling."
-                    )
-                    endpoint_description = f"{endpoint_description}{warning}"
-                    tags = ["destructive"]
-                elif annotations_dict.get("readOnlyHint"):
-                    tags = ["read-only"]
+                if annotations_dict:
+                    openapi_extra = {"x-mcp-annotations": annotations_dict}
 
-        post_kwargs = {
-            "summary": endpoint_name.replace("_", " ").title(),
-            "description": endpoint_description,
-            "response_model_exclude_none": True,
-            "dependencies": [Depends(api_dependency)] if api_dependency else [],
-        }
-        if openapi_extra is not None:
-            post_kwargs["openapi_extra"] = openapi_extra
-        if tags is not None:
-            post_kwargs["tags"] = tags
+                    if annotations_dict.get("destructiveHint"):
+                        warning = (
+                            "\n\n**Warning:** This tool is marked destructive "
+                            "(destructiveHint). It may have irreversible side effects "
+                            "(for example, spending money or modifying remote state). "
+                            "Confirm with the user before calling."
+                        )
+                        endpoint_description = f"{endpoint_description}{warning}"
+                        tags = ["destructive"]
+                    elif annotations_dict.get("readOnlyHint"):
+                        tags = ["read-only"]
 
-        app.post(f"/{endpoint_name}", **post_kwargs)(tool_handler)
+            post_kwargs = {
+                "summary": endpoint_name.replace("_", " ").title(),
+                "description": endpoint_description,
+                "response_model_exclude_none": True,
+                "dependencies": [Depends(api_dependency)] if api_dependency else [],
+            }
+            if openapi_extra is not None:
+                post_kwargs["openapi_extra"] = openapi_extra
+            if tags is not None:
+                post_kwargs["tags"] = tags
+
+            app.post(f"/{endpoint_name}", **post_kwargs)(tool_handler)
+        except Exception:
+            logger.exception(
+                "Failed to register tool '%s'; skipping this tool",
+                endpoint_name,
+            )
 
 
 @asynccontextmanager

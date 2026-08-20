@@ -158,7 +158,7 @@ Docker (this fork's image):
 
 ```bash
 docker run -p 8000:8000 -v ${PWD}/examples/pmxt-stdio.json:/config.json \
-  ghcr.io/compcj/mcpo:v0.0.22 --config /config.json
+  ghcr.io/compcj/mcpo:v0.0.23 --config /config.json
 ```
 
 Tools are available under `/pmxt/...`, for example:

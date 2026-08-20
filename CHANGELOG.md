@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.23] - 2026-08-20
+
+### Fixed
+
+* **`AssertionError: Custom field not found` on PMXT (and similar) schemas**: Tool schemas that use OpenAPI `$ref`s (`#/components/schemas/...`) or `allOf` wrappers no longer abort server startup. Unresolved refs become free-form objects, and a single bad tool is skipped instead of failing the whole MCP server.
+
 ## [0.0.22] - 2026-08-20
 
 ### Fixed

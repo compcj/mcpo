@@ -2,7 +2,7 @@ import pytest
 from pydantic import BaseModel, Field, create_model
 from typing import Any, List, Dict, Union
 
-from mcpo.utils.main import _process_schema_property, get_model_fields
+from mcpo.utils.main import _process_schema_property, get_model_fields, collect_schema_defs
 
 
 _model_cache = {}
@@ -432,3 +432,71 @@ def test_ref_to_parent_node():
 
     assert result_type == Any
     assert result_field.description == ""
+
+
+def test_unresolved_openapi_component_ref_does_not_raise():
+    """PMXT tools reference OpenAPI components that are not inlined into $defs."""
+    schema = {"$ref": "#/components/schemas/EventFilterCriteria"}
+    result_type, result_field = _process_schema_property(
+        _model_cache, schema, "fetchEventsPaginated_form_model", "filter", False, {}
+    )
+    assert result_type == Dict[str, Any]
+    assert result_field.default is None
+
+
+def test_allof_unresolved_ref_does_not_raise():
+    schema = {
+        "allOf": [{"$ref": "#/components/schemas/UnifiedMarket"}],
+        "description": "Pass a UnifiedMarket directly.",
+    }
+    result_type, result_field = _process_schema_property(
+        _model_cache, schema, "fetchMarket_form_model", "market", False, {}
+    )
+    assert result_type == Dict[str, Any]
+    assert result_field.description == "Pass a UnifiedMarket directly."
+
+
+def test_component_schema_ref_is_resolved():
+    schema = {"$ref": "#/components/schemas/EventFilterCriteria"}
+    defs = {
+        "EventFilterCriteria": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+        }
+    }
+    result_type, result_field = _process_schema_property(
+        _model_cache, schema, "test", "filter", False, defs
+    )
+    assert issubclass(result_type, BaseModel)
+    assert "query" in result_type.model_fields
+
+
+def test_collect_schema_defs_from_openapi_components():
+    schema = {
+        "properties": {},
+        "components": {
+            "schemas": {
+                "MarketFilterCriteria": {"type": "object", "properties": {}},
+            }
+        },
+    }
+    defs = collect_schema_defs(schema)
+    assert "MarketFilterCriteria" in defs
+
+
+def test_pmxt_paginated_filter_ref():
+    properties = {
+        "exchange": {"type": "string", "enum": ["polymarket", "kalshi"]},
+        "filter": {"$ref": "#/components/schemas/EventFilterCriteria"},
+        "limit": {"type": "number"},
+    }
+    model_fields = get_model_fields(
+        "fetchEventsPaginated_form_model",
+        properties,
+        required_fields=["exchange"],
+        schema_defs={},
+    )
+    FormModel = create_model("FetchEventsPaginatedForm", **model_fields)
+    schema = FormModel.model_json_schema()
+    assert schema["properties"]["exchange"]["enum"] == ["polymarket", "kalshi"]
+    assert "filter" in schema["properties"]

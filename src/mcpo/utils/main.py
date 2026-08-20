@@ -107,6 +107,23 @@ def _field_for_schema(
     return Field(**field_args)
 
 
+def collect_schema_defs(schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Gather named schemas from JSON Schema and OpenAPI locations."""
+    if not schema:
+        return {}
+    defs: Dict[str, Any] = {}
+    for key in ("$defs", "definitions"):
+        extra = schema.get(key)
+        if isinstance(extra, dict):
+            defs.update(extra)
+    components = schema.get("components")
+    if isinstance(components, dict):
+        schemas = components.get("schemas")
+        if isinstance(schemas, dict):
+            defs.update(schemas)
+    return defs
+
+
 def _process_schema_property(
     _model_cache: Dict[str, Type],
     prop_schema: Dict[str, Any],
@@ -123,9 +140,10 @@ def _process_schema_property(
         A tuple containing (python_type_hint, pydantic_field).
         The pydantic_field contains default value and description.
     """
+    schema_defs = schema_defs or {}
     if "$ref" in prop_schema:
         ref = prop_schema["$ref"]
-        if ref.startswith("#/properties/"):
+        if isinstance(ref, str) and ref.startswith("#/properties/"):
             # Remove common prefix in pathes.
             prefix_path = model_name_prefix.split("_form_model_")[-1]
             ref_path = ref.split("#/properties/")[-1]
@@ -138,9 +156,39 @@ def _process_schema_property(
             if prefix_path.startswith(ref_path):
                 # TODO: Find the exact type hint for the $ref.
                 return Any, Field(default=None, description="")
-        ref = ref.split("/")[-1]
-        assert ref in schema_defs, "Custom field not found"
-        prop_schema = schema_defs[ref]
+        ref_name = ref.split("/")[-1] if isinstance(ref, str) else None
+        resolved = schema_defs.get(ref_name) if ref_name else None
+        if not isinstance(resolved, dict):
+            logger.warning(
+                "Unresolved $ref '%s' for %s.%s; treating as a free-form object",
+                ref,
+                model_name_prefix,
+                prop_name,
+            )
+            desc = prop_schema.get("description", "")
+            default_value = ... if is_required else None
+            return Dict[str, Any], Field(default=default_value, description=desc)
+        # Overlay sibling keywords (e.g. description) onto the resolved schema
+        prop_schema = {
+            **resolved,
+            **{k: v for k, v in prop_schema.items() if k != "$ref"},
+        }
+
+    if "allOf" in prop_schema:
+        merged: Dict[str, Any] = {}
+        for option in prop_schema.get("allOf") or []:
+            if isinstance(option, dict):
+                merged.update(option)
+        if "description" in prop_schema:
+            merged.setdefault("description", prop_schema["description"])
+        return _process_schema_property(
+            _model_cache,
+            merged,
+            model_name_prefix,
+            prop_name,
+            is_required,
+            schema_defs=schema_defs,
+        )
 
     prop_type = prop_schema.get("type")
     prop_desc = prop_schema.get("description", "")
