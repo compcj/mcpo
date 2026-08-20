@@ -154,6 +154,13 @@ mcpo --config examples/pmxt-stdio.json --port 8000
 mcpo --config examples/pmxt-http.json --port 8000
 ```
 
+Docker (this fork's image):
+
+```bash
+docker run -p 8000:8000 -v ${PWD}/examples/pmxt-stdio.json:/config.json \
+  ghcr.io/compcj/mcpo:v0.0.21 --config /config.json
+```
+
 Tools are available under `/pmxt/...`, for example:
 
 - Interactive docs: http://localhost:8000/pmxt/docs

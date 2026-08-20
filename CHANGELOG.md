@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.21] - 2026-08-20
+
+### Added
+
+* **JSON Schema enum preservation**: MCP tool `enum` constraints are now emitted as OpenAPI enums (`Literal` types), so clients and LLMs see allowed values such as PMXT `exchange` venues instead of a plain string.
+* **MCP tool annotations in OpenAPI**: Tool annotations are published as `x-mcp-annotations`. Destructive tools get a warning in the operation description and a `destructive` tag; read-only tools get a `read-only` tag.
+* **@pmxt/mcp examples**: Added `examples/pmxt-stdio.json` and `examples/pmxt-http.json` plus README usage for proxying [pmxt-mcp](https://github.com/pmxt-dev/pmxt-mcp).
+
 ## [0.0.20] - 2026-02-27
 
 ### Added
