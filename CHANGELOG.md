@@ -2,28 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.0.23] - 2026-08-20
+## [0.0.20f1] - 2026-11-21
 
-### Fixed
-
-* **`AssertionError: Custom field not found` on PMXT (and similar) schemas**: Tool schemas that use OpenAPI `$ref`s (`#/components/schemas/...`) or `allOf` wrappers no longer abort server startup. Unresolved refs become free-form objects, and a single bad tool is skipped instead of failing the whole MCP server.
-
-## [0.0.22] - 2026-08-20
-
-### Fixed
-
-* **Docker image ImportError for `streamablehttp_client`**: The image used `uv pip install .`, which resolved the unpinned `mcp>=1.17.0` dependency to MCP SDK v2. That release removed `streamablehttp_client`. Pin `mcp` to `>=1.17.0,<2` and install with `uv sync --frozen` so the image stays on the v1 client API.
-
-## [0.0.21] - 2026-08-20
+This fork release is based on upstream `0.0.20` and supersedes the fork versions `0.0.21`, `0.0.22`, and `0.0.23`. Use `ghcr.io/compcj/mcpo:v0.0.20f1` for Docker. The Python distribution is versioned `0.0.20+f1`.
 
 ### Added
 
-* **JSON Schema enum preservation**: MCP tool `enum` constraints are now emitted as OpenAPI enums (`Literal` types), so clients and LLMs see allowed values such as PMXT `exchange` venues instead of a plain string.
-* **MCP tool annotations in OpenAPI**: Tool annotations are published as `x-mcp-annotations`. Destructive tools get a warning in the operation description and a `destructive` tag; read-only tools get a `read-only` tag.
-* **@pmxt/mcp examples**: Added `examples/pmxt-stdio.json` and `examples/pmxt-http.json` plus README usage for proxying [pmxt-mcp](https://github.com/pmxt-dev/pmxt-mcp).
+* OpenAPI schemas preserve MCP tool enums and expose `x-mcp-annotations`. Operations also carry `read-only` and `destructive` tags where applicable.
+* The PMXT examples cover stdio and Streamable HTTP transports.
+
+### Changed
+
+* `MCP_REQUEST_TIMEOUT` bounds connection setup and MCP operations. If the connection fails or times out after a tool call starts, mcpo returns HTTP 502 with `detail.code` set to `tool_execution_unknown` and leaves the retry decision to the caller.
+
+### Fixed
+
+* Failed connections are cleaned up and can reconnect on a later request. Hot reload keeps working connections available if a replacement fails to start.
+* Tool schemas with OpenAPI component references or `allOf` wrappers can register. An invalid tool is skipped without interrupting the rest of the server.
+* Docker installs the locked MCP SDK 1.x and AnyIO 4.14.2 or newer, below 5, to preserve transport compatibility and avoid cancellation-related CPU spinning.
 
 ## [0.0.20] - 2026-02-27
 

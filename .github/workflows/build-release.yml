@@ -2,61 +2,38 @@ name: Release
 
 on:
     push:
-        branches:
-            - main
+        tags:
+            - 'v*'
 
 jobs:
     release:
         runs-on: ubuntu-latest
+        permissions:
+            contents: write
 
         steps:
             - name: Checkout repository
               uses: actions/checkout@v4
 
-            - name: Check for changes in pyproject.toml
+            - name: Install uv
+              run: pip install uv
+
+            - name: Verify release tag and extract its changelog entry
               run: |
-                  git diff --cached --diff-filter=d pyproject.toml || {
-                    echo "No changes to pyproject.toml"
-                    exit 1
-                  }
+                  version=$(uv version --short)
+                  test "$GITHUB_REF_NAME" = "v${version/+f/f}"
+                  awk -v entry="[${GITHUB_REF_NAME#v}]" '
+                      /^## \[/ { if (found) exit; found = ($2 == entry); next }
+                      found { print }
+                  ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+                  test -s "$RUNNER_TEMP/release-notes.md"
 
-            - name: Get version number from pyproject.toml
-              id: get_version
-              run: |
-                  VERSION=$(awk -F' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2 }' pyproject.toml)
-                  echo "Detected version: $VERSION"
-                  echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            - name: Build Python distributions
+              run: uv build --no-sources
 
-            - name: Extract latest CHANGELOG entry
-              id: changelog
-              run: |
-                  CHANGELOG_CONTENT=$(awk 'BEGIN {print_section=0;} /^## \[/ {if (print_section == 0) {print_section=1;} else {exit;}} print_section {print;}' CHANGELOG.md)
-                  CHANGELOG_ESCAPED=$(echo "$CHANGELOG_CONTENT" | sed ':a;N;$!ba;s/\n/%0A/g')
-                  echo "Extracted latest release notes from CHANGELOG.md:" 
-                  echo -e "$CHANGELOG_CONTENT" 
-                  echo "content=$CHANGELOG_ESCAPED" >> "$GITHUB_OUTPUT"
-
-            - name: Create GitHub release
-              uses: actions/github-script@v7
-              with:
-                  github-token: ${{ secrets.GITHUB_TOKEN }}
-                  script: |
-                      const changelog = `${{ steps.changelog.outputs.content }}`;
-                      const release = await github.rest.repos.createRelease({
-                        owner: context.repo.owner,
-                        repo: context.repo.repo,
-                        tag_name: `v${{ steps.get_version.outputs.version }}`,
-                        name: `v${{ steps.get_version.outputs.version }}`,
-                        body: changelog,
-                      })
-                      console.log(`Created release ${release.data.html_url}`)
-
-            - name: Upload package to GitHub release
-              uses: actions/upload-artifact@v4
-              with:
-                  name: package
-                  path: |
-                      .
-                      !.git
+            - name: Publish GitHub release and distributions
               env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --latest \
+                      --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"

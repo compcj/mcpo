@@ -27,7 +27,13 @@ mcpo makes your AI tools usable, secure, and interoperable—right now, with zer
 
 ## 🚀 Quick Usage
 
-We recommend using uv for lightning-fast startup and zero config.
+To install this fork's `0.0.20f1` release (Python package version `0.0.20+f1`):
+
+```bash
+pip install "git+https://github.com/compcj/mcpo.git@v0.0.20f1"
+```
+
+To run the upstream package with uv:
 
 ```bash
 uvx mcpo --port 8000 --api-key "top-secret" -- your_mcp_server_command
@@ -61,7 +67,7 @@ mcpo --port 8000 --api-key "top-secret" --server-type "streamable-http" -- http:
 You can also run mcpo via Docker with no installation:
 
 ```bash
-docker run -p 8000:8000 ghcr.io/open-webui/mcpo:main --api-key "top-secret" -- your_mcp_server_command
+docker run -p 8000:8000 ghcr.io/compcj/mcpo:v0.0.20f1 --api-key "top-secret" -- your_mcp_server_command
 ```
 
 Example:
@@ -158,7 +164,7 @@ Docker (this fork's image):
 
 ```bash
 docker run -p 8000:8000 -v ${PWD}/examples/pmxt-stdio.json:/config.json \
-  ghcr.io/compcj/mcpo:v0.0.23 --config /config.json
+  ghcr.io/compcj/mcpo:v0.0.20f1 --config /config.json
 ```
 
 Tools are available under `/pmxt/...`, for example:
