@@ -1,8 +1,8 @@
 import os
 import json
 import tempfile
-import asyncio
-from unittest.mock import AsyncMock, Mock, patch
+from contextlib import asynccontextmanager
+from unittest.mock import Mock, patch
 import pytest
 from fastapi import FastAPI
 
@@ -119,13 +119,15 @@ async def test_reload_config_handler():
 
     new_config = {"mcpServers": {"new_server": {"command": "echo", "args": ["new"]}}}
 
-    # Mock create_sub_app to avoid actually creating apps
-    with patch("mcpo.main.create_sub_app") as mock_create_sub_app:
-        mock_sub_app = Mock()
-        mock_create_sub_app.return_value = mock_sub_app
+    @asynccontextmanager
+    async def child_lifespan(child):
+        child.state.is_connected = True
+        yield
 
-        # Mock app.mount to avoid actual mounting
-        app.mount = Mock()
+    # Exercise real route publication while keeping the transport local to this test.
+    with patch("mcpo.main.create_sub_app") as mock_create_sub_app:
+        mock_sub_app = FastAPI(lifespan=child_lifespan)
+        mock_create_sub_app.return_value = mock_sub_app
 
         await reload_config_handler(app, new_config)
 
@@ -135,8 +137,11 @@ async def test_reload_config_handler():
         # Verify create_sub_app was called for the new server
         mock_create_sub_app.assert_called_once()
 
-        # Verify mount was called
-        app.mount.assert_called_once()
+        assert any(
+            route.path == "/new_server" and route.app is mock_sub_app
+            for route in app.routes
+        )
+        await app.state.active_lifespans["new_server"].__aexit__(None, None, None)
 
 
 def test_config_watcher_initialization():

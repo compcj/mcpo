@@ -229,9 +229,47 @@ On first connection, mcpo will:
 
 OAuth is supported for `streamable-http` server types. See [OAUTH_GUIDE.md](OAUTH_GUIDE.md) for detailed documentation.
 
+## Connection recovery and safe retries
+
+MCPO requires AnyIO 4.14.2 or newer (below 5), which includes the fix for
+cancellation-related CPU spinning. The Docker image installs the checked-in
+`uv.lock`; rebuild and recreate the container to apply this update. MCP SDK 1.x
+remains required by the current transport integration.
+
+Each MCP connection has a dedicated task that opens and closes its transport and
+session. A failed connection is cleaned up, and a subsequent request can establish
+a new one. Hot reload prepares replacement connections before switching routes;
+if preparation fails, existing connections remain available. Removed connections
+and connections added by hot reload are also closed during cleanup and shutdown.
+
+`MCP_REQUEST_TIMEOUT` sets a positive, finite deadline in seconds for connection
+setup and each MCP operation (default: `900`). For example, set
+`MCP_REQUEST_TIMEOUT=60` in the Docker container environment to limit each MCP wait
+to one minute. This also bounds waiting when an upstream transport loses a response
+without closing its connection. Choose a value that accommodates your longest
+expected tool execution. A timeout retires the shared connection and can interrupt
+other calls using it; it does not guarantee cancellation of upstream work.
+Remote HTTP session termination gets an additional deadline of five seconds or
+`MCP_REQUEST_TIMEOUT`, whichever is shorter. MCPO closes the local connection even
+if that termination request times out; the remote server may retain its session
+until its own cleanup runs.
+
+MCPO can retry initialization before dispatching a tool. **Once a tool call has
+started, MCPO does not automatically send it again.** A lost connection or request
+timeout returns HTTP 502 with `detail.code` set to `tool_execution_unknown`: the operation may
+have completed upstream even though its result was lost. Check the upstream state
+before retrying writes, especially orders, payments or deletions. HTTP clients and
+reverse proxies must not blindly retry these responses either.
+
+MCPO's tool-dispatch and connection-error logs contain endpoint/server names and
+error types, not argument values or upstream exception bodies. Upstream servers
+and MCP SDK diagnostics are separate: SDK error logs as well as protocol-level
+DEBUG logs can contain sensitive response fragments. Protect log access and avoid
+protocol-level DEBUG logging when sending credentials.
+
 ## 🔧 Requirements
 
-- Python 3.8+
+- Python 3.11+
 - uv (optional, but highly recommended for performance + packaging)
 
 ## 🛠️ Development & Testing
@@ -245,7 +283,7 @@ To contribute or run tests locally:
     cd mcpo
 
     # Install dependencies (including dev dependencies)
-    uv sync --dev
+    uv sync --locked --dev
     ```
 
 2.  **Run tests:**

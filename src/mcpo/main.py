@@ -1,15 +1,18 @@
 import asyncio
-import contextlib
 import json
 import logging
+import math
 import os
 import signal
 import socket
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
+import httpx
 import uvicorn
+from anyio import ClosedResourceError
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import Mount
@@ -54,10 +57,29 @@ class GracefulShutdown:
         task.add_done_callback(self.tasks.discard)
 
 
+class _MCPHTTPClient(httpx.AsyncClient):
+    """Bound best-effort remote session termination inside the HTTP call."""
+
+    def __init__(self, *, session_close_timeout: float, **kwargs):
+        super().__init__(**kwargs)
+        self._session_close_timeout = session_close_timeout
+
+    async def delete(self, url, **kwargs):
+        try:
+            async with asyncio.timeout(self._session_close_timeout):
+                return await super().delete(url, **kwargs)
+        except TimeoutError:
+            # Catch at the HTTP layer so the SDK can finish closing its AnyIO
+            # contexts normally, even when the upstream never acknowledges DELETE.
+            raise TimeoutError("MCP session termination timed out") from None
+
+
 class MCPConnectionManager:
     """
-    Manages lifecycle of the MCP ClientSession and underlying transport so that
-    we can reconnect transparently when the remote server drops the connection.
+    Own the SDK's transport and session contexts in one dedicated task.
+
+    AnyIO cancel scopes must be entered and exited by the same task. HTTP
+    requests can share a session, but must never unwind its contexts themselves.
     """
 
     def __init__(
@@ -70,6 +92,7 @@ class MCPConnectionManager:
         headers: Optional[Dict[str, str]],
         connection_timeout: Optional[int],
         auth_provider: Optional[Any] = None,
+        request_timeout: Optional[float] = None,
     ):
         self.server_type = normalize_server_type(server_type)
         self.command = command
@@ -78,90 +101,180 @@ class MCPConnectionManager:
         self.headers = headers
         self.connection_timeout = connection_timeout
         self.auth_provider = auth_provider
+        self.request_timeout = float(
+            request_timeout
+            if request_timeout is not None
+            else os.getenv("MCP_REQUEST_TIMEOUT", "900")
+        )
+        if not math.isfinite(self.request_timeout) or self.request_timeout <= 0:
+            raise ValueError("MCP_REQUEST_TIMEOUT must be a positive finite number")
 
         self._session: Optional[ClientSession] = None
-        self._client_context = None
         self._lock = asyncio.Lock()
-        self._initialize_lock = asyncio.Lock()
-        self._initialize_result = None
-        self._initialized = False
+        self._session_task: Optional[asyncio.Task] = None
+        self._ready: Optional[asyncio.Future] = None
+        self._stopping = False
+        self._closed = False
 
     @property
     def current_session(self) -> Optional[ClientSession]:
         return self._session
 
     async def get_session(self) -> ClientSession:
-        async with self._lock:
-            if self._session is None:
-                await self._open_session_locked()
-            return self._session
+        session, _ = await self.ensure_initialized()
+        return session
 
     async def ensure_initialized(self):
-        session = await self.get_session()
-        if self._initialized and self._initialize_result is not None:
-            return session, self._initialize_result
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("MCP connection manager is closed")
+            if self._session_task is not None and (
+                self._stopping
+                or self._session_task.done()
+                or (self._ready.done() and self._session is None)
+            ):
+                await self._close_session_locked()
+            if self._session_task is None:
+                self._ready = asyncio.get_running_loop().create_future()
+                # Retrieve failures even when every waiting HTTP request was
+                # cancelled; awaiting the future still raises the same error.
+                self._ready.add_done_callback(
+                    lambda future: None if future.cancelled() else future.exception()
+                )
+                self._session_task = asyncio.create_task(
+                    self._run_session(self._ready), name="mcpo-session"
+                )
 
-        async with self._initialize_lock:
-            if not self._initialized or self._initialize_result is None:
-                initialize_result = await session.initialize()
-                self._initialize_result = initialize_result
-                self._initialized = True
-            else:
-                initialize_result = self._initialize_result
+                # The owner can be cancelled before executing its first line.
+                # Wake initialization waiters even if close() is also cancelled.
+                def owner_done(_, ready=self._ready):
+                    if not ready.done():
+                        ready.set_exception(
+                            ClosedResourceError("MCP connection closed")
+                        )
 
-        return session, initialize_result
+                self._session_task.add_done_callback(owner_done)
+            ready = self._ready
+
+        # Do not hold the lifecycle lock during network I/O. Shutdown must be
+        # able to interrupt an unfinished handshake. One cancelled waiter must
+        # not cancel setup shared with another request.
+        session, result = await asyncio.shield(ready)
+        if self._closed or self._stopping or session is not self._session:
+            raise ClosedResourceError("MCP connection closed during initialization")
+        return session, result
 
     async def reconnect(self):
         async with self._lock:
+            if self._closed:
+                raise RuntimeError("MCP connection manager is closed")
             await self._close_session_locked()
-            await self._open_session_locked()
-        # Run initialize outside of the lock to avoid deadlocks on nested calls
         return await self.ensure_initialized()
 
+    async def run_with_session(self, session, operation, *args, **kwargs):
+        """Wake a request even if the SDK cannot publish its connection error."""
+        owner = self._session_task
+        if (
+            self._closed
+            or session is not self._session
+            or self._stopping
+            or owner is None
+            or owner.done()
+        ):
+            raise ClosedResourceError("MCP connection closed")
+        request_task = asyncio.create_task(operation(*args, **kwargs))
+        try:
+            done, _ = await asyncio.wait(
+                (request_task, owner),
+                timeout=self.request_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # A received result is authoritative even if the transport ended
+            # simultaneously. Never replace success with an ambiguous error.
+            if request_task in done:
+                return await request_task
+            if not done:
+                raise TimeoutError("MCP request timed out")
+            raise ClosedResourceError("MCP connection closed")
+        finally:
+            if not request_task.done():
+                request_task.cancel()
+            await asyncio.shield(asyncio.gather(request_task, return_exceptions=True))
+
+    async def invalidate(self, session: ClientSession):
+        """Retire a failed session without replaying calls or closing a newer one."""
+        async with self._lock:
+            if self._session is session:
+                await self._close_session_locked()
+
     async def close(self):
+        self._closed = True
         async with self._lock:
             await self._close_session_locked()
 
-    async def _open_session_locked(self):
-        client_context = self._create_client_context()
+    async def _run_session(self, ready: asyncio.Future):
         try:
-            connection = await client_context.__aenter__()
-        except Exception:
-            # Ensure the context is closed if entering fails
-            with contextlib.suppress(Exception):
-                await client_context.__aexit__(None, None, None)
-            raise
-
-        reader, writer, *_ = connection
-        session = ClientSession(reader, writer)
-        try:
-            await session.__aenter__()
-        except Exception:
-            with contextlib.suppress(Exception):
-                await session.__aexit__(None, None, None)
-            with contextlib.suppress(Exception):
-                await client_context.__aexit__(None, None, None)
-            raise
-
-        self._client_context = client_context
-        self._session = session
-        self._initialized = False
-        self._initialize_result = None
+            async with AsyncExitStack() as stack:
+                try:
+                    async with asyncio.timeout(self.request_timeout):
+                        connection = await stack.enter_async_context(
+                            self._create_client_context()
+                        )
+                        reader, writer, *_ = connection
+                        session = await stack.enter_async_context(
+                            ClientSession(
+                                reader,
+                                writer,
+                                read_timeout_seconds=timedelta(
+                                    seconds=self.request_timeout
+                                ),
+                            )
+                        )
+                        result = await session.initialize()
+                    self._session = session
+                    ready.set_result((session, result))
+                    await asyncio.Event().wait()
+                finally:
+                    # A transport child may have already cancelled this owner.
+                    # Mark teardown before the SDK contexts unwind so another
+                    # failing request cannot interrupt cleanup with a second cancel.
+                    self._stopping = True
+                    self._session = None
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.set_exception(ClosedResourceError("MCP connection closed"))
+        except Exception as error:
+            # Upstream exception text can contain URLs, credentials or arguments.
+            logger.warning("MCP connection ended (%s)", type(error).__name__)
+            if not ready.done():
+                ready.set_exception(error)
+        finally:
+            self._session = None
+            if not ready.done():
+                ready.set_exception(ClosedResourceError("MCP connection closed"))
 
     async def _close_session_locked(self):
-        session, client_context = self._session, self._client_context
-        self._session = None
-        self._client_context = None
-        self._initialized = False
-        self._initialize_result = None
+        task = self._session_task
+        if task is None:
+            return
+        if not task.done() and not self._stopping:
+            self._stopping = True
+            task.cancel()
+        # Shield the owner, including its context-manager cleanup, from repeated
+        # request cancellation. Gather also handles cancellation before it starts.
+        await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        if not self._ready.done():
+            self._ready.set_exception(ClosedResourceError("MCP connection closed"))
+        self._session_task = None
+        self._ready = None
+        self._stopping = False
 
-        if session is not None:
-            with contextlib.suppress(Exception):
-                await session.__aexit__(None, None, None)
-
-        if client_context is not None:
-            with contextlib.suppress(Exception):
-                await client_context.__aexit__(None, None, None)
+    def _create_http_client(self, **kwargs):
+        return _MCPHTTPClient(
+            session_close_timeout=min(self.request_timeout, 5.0),
+            follow_redirects=True,
+            **kwargs,
+        )
 
     def _create_client_context(self):
         if self.server_type == "stdio":
@@ -183,6 +296,7 @@ class MCPConnectionManager:
                 url=self.args[0],
                 headers=self.headers,
                 auth=self.auth_provider,
+                httpx_client_factory=self._create_http_client,
             )
         raise ValueError(f"Unsupported server type: {self.server_type}")
 
@@ -220,26 +334,35 @@ def validate_server_config(server_name: str, server_cfg: Dict[str, Any]) -> None
                 raise ValueError(f"Server '{server_name}' 'disabledTools' must contain only strings")
 
 
+def validate_config_data(config_data: Dict[str, Any]) -> None:
+    """Apply the same validation to startup files and hot-reload snapshots."""
+    if not isinstance(config_data, dict):
+        raise ValueError("MCP configuration must be an object")
+    mcp_servers = config_data.get("mcpServers")
+    if not isinstance(mcp_servers, dict) or not mcp_servers:
+        raise ValueError("No 'mcpServers' found in config file.")
+    for server_name, server_cfg in mcp_servers.items():
+        if (
+            not isinstance(server_name, str)
+            or not server_name
+            or not isinstance(server_cfg, dict)
+        ):
+            raise ValueError(
+                "Each MCP server must have a name and an object configuration"
+            )
+        validate_server_config(server_name, server_cfg)
+        header_config = server_cfg.get("client_header_forwarding", {})
+        if header_config:
+            validate_client_header_forwarding_config(server_name, header_config)
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load and validate config from file."""
     try:
         with open(config_path, "r") as f:
             config_data = json.load(f)
 
-        mcp_servers = config_data.get("mcpServers", {})
-        if not mcp_servers:
-            logger.error(f"No 'mcpServers' found in config file: {config_path}")
-            raise ValueError("No 'mcpServers' found in config file.")
-
-        # Validate each server configuration
-        for server_name, server_cfg in mcp_servers.items():
-            validate_server_config(server_name, server_cfg)
-
-            # Validate client header forwarding configuration if present
-            header_config = server_cfg.get("client_header_forwarding", {})
-            if header_config:
-                validate_client_header_forwarding_config(server_name, header_config)
-
+        validate_config_data(config_data)
         return config_data
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in config file {config_path}: {e}")
@@ -359,136 +482,103 @@ def mount_config_servers(
         main_app.mount(f"{path_prefix}{server_name}", sub_app)
 
 
-def unmount_servers(main_app: FastAPI, path_prefix: str, server_names: list):
-    """Unmount specific MCP servers."""
-    active_lifespans = getattr(main_app.state, "active_lifespans", {})
+def _get_reload_lock(app: FastAPI):
+    lock = getattr(app.state, "reload_lock", None)
+    if lock is None:
+        lock = app.state.reload_lock = asyncio.Lock()
+    return lock
 
-    for server_name in server_names:
-        mount_path = f"{path_prefix}{server_name}"
 
-        # Clean up lifespan context if it exists
-        if server_name in active_lifespans:
-            lifespan_context = active_lifespans[server_name]
+def _retire_lifespans(app: FastAPI, contexts):
+    """Track cleanup independently of the reload request that initiated it."""
+
+    async def cleanup():
+        for context in reversed(contexts):
             try:
-                # Schedule cleanup of the lifespan context
-                asyncio.create_task(lifespan_context.__aexit__(None, None, None))
-            except Exception as e:
-                logger.warning(f"Error cleaning up lifespan for {server_name}: {e}")
-            finally:
-                del active_lifespans[server_name]
+                await context.__aexit__(None, None, None)
+            except Exception as error:
+                logger.warning("MCP lifespan cleanup failed (%s)", type(error).__name__)
+
+    pending = getattr(app.state, "retiring_lifespans", None)
+    if pending is None:
+        pending = app.state.retiring_lifespans = set()
+    task = asyncio.create_task(cleanup(), name="mcpo-lifespan-cleanup")
+    pending.add(task)
+    task.add_done_callback(pending.discard)
+    return task
 
 
 async def reload_config_handler(main_app: FastAPI, new_config_data: Dict[str, Any]):
-    """Handle config reload by comparing and updating mounted servers."""
-    old_config_data = getattr(main_app.state, "config_data", {})
-    backup_routes = list(main_app.router.routes)  # Backup current routes for rollback
-
-    try:
-        old_servers = set(old_config_data.get("mcpServers", {}).keys())
-        new_servers = set(new_config_data.get("mcpServers", {}).keys())
-
-        # Find servers to add, remove, and potentially update
-        servers_to_add = new_servers - old_servers
-        servers_to_remove = old_servers - new_servers
-        servers_to_check = old_servers & new_servers
-
-        # Get app configuration from state
-        cors_allow_origins = getattr(main_app.state, "cors_allow_origins", ["*"])
-        api_key = getattr(main_app.state, "api_key", None)
-        strict_auth = getattr(main_app.state, "strict_auth", False)
-        api_dependency = getattr(main_app.state, "api_dependency", None)
-        connection_timeout = getattr(main_app.state, "connection_timeout", None)
-        lifespan = getattr(main_app.state, "lifespan", None)
+    """Stage replacements before swapping routes, then await old session cleanup."""
+    async with _get_reload_lock(main_app):
+        if getattr(main_app.state, "shutting_down", False):
+            return
+        try:
+            validate_config_data(new_config_data)
+        except ValueError as error:
+            logger.error(
+                "Invalid reload configuration; keeping current connections (%s)",
+                type(error).__name__,
+            )
+            return
+        old_config = getattr(main_app.state, "config_data", {}).get("mcpServers", {})
+        new_config = new_config_data.get("mcpServers", {})
+        changed = {
+            name
+            for name in new_config
+            if name not in old_config or old_config[name] != new_config[name]
+        }
+        removed = set(old_config) - set(new_config)
         path_prefix = getattr(main_app.state, "path_prefix", "/")
+        staged_routes = []
+        staged_contexts = {}
+        main_app.state.staging_reload_task = asyncio.current_task()
+        try:
+            for name in sorted(changed):
+                sub_app = create_sub_app(
+                    name,
+                    new_config[name],
+                    getattr(main_app.state, "cors_allow_origins", ["*"]),
+                    getattr(main_app.state, "api_key", None),
+                    getattr(main_app.state, "strict_auth", False),
+                    getattr(main_app.state, "api_dependency", None),
+                    getattr(main_app.state, "connection_timeout", None),
+                    getattr(main_app.state, "lifespan", None),
+                )
+                route = Mount(f"{path_prefix}{name}", app=sub_app)
+                context = sub_app.router.lifespan_context(sub_app)
+                await context.__aenter__()
+                staged_contexts[name] = context
+                staged_routes.append(route)
+        except BaseException as error:
+            await asyncio.shield(
+                _retire_lifespans(main_app, list(staged_contexts.values()))
+            )
+            if not isinstance(error, Exception):
+                raise
+            logger.error(
+                "Config reload failed; previous connections retained (%s)",
+                type(error).__name__,
+            )
+            return
+        finally:
+            main_app.state.staging_reload_task = None
 
-        # Remove servers that are no longer in config
-        if servers_to_remove:
-            logger.info(f"Removing servers: {list(servers_to_remove)}")
-            unmount_servers(main_app, path_prefix, list(servers_to_remove))
-
-        # Check for configuration changes in existing servers
-        servers_to_update = []
-        for server_name in servers_to_check:
-            old_cfg = old_config_data["mcpServers"][server_name]
-            new_cfg = new_config_data["mcpServers"][server_name]
-            if old_cfg != new_cfg:
-                servers_to_update.append(server_name)
-
-        # Remove and re-add updated servers
-        if servers_to_update:
-            logger.info(f"Updating servers: {servers_to_update}")
-            unmount_servers(main_app, path_prefix, servers_to_update)
-            servers_to_add.update(servers_to_update)
-
-        # Add new servers and updated servers
-        if servers_to_add:
-            logger.info(f"Adding servers: {list(servers_to_add)}")
-
-            # Store lifespan contexts for cleanup
-            if not hasattr(main_app.state, "active_lifespans"):
-                main_app.state.active_lifespans = {}
-
-            for server_name in servers_to_add:
-                server_cfg = new_config_data["mcpServers"][server_name]
-                try:
-                    sub_app = create_sub_app(
-                        server_name,
-                        server_cfg,
-                        cors_allow_origins,
-                        api_key,
-                        strict_auth,
-                        api_dependency,
-                        connection_timeout,
-                        lifespan,
-                    )
-                    main_app.mount(f"{path_prefix}{server_name}", sub_app)
-
-                    # Start the lifespan for the new sub-app when available
-                    lifespan_context = None
-                    lifespan_factory = getattr(sub_app.router, "lifespan_context", None)
-                    if lifespan_factory:
-                        lifespan_context = lifespan_factory(sub_app)
-                    if lifespan_context and hasattr(lifespan_context, "__aenter__"):
-                        await lifespan_context.__aenter__()
-                        # Store the context manager for cleanup later
-                        main_app.state.active_lifespans[server_name] = lifespan_context
-                    else:
-                        logger.debug(
-                            "Skipping lifespan startup for server '%s' (no async context manager)",
-                            server_name,
-                        )
-
-                    # Check if connection was successful
-                    is_connected = getattr(sub_app.state, "is_connected", False)
-                    if is_connected:
-                        logger.info(
-                            f"Successfully connected to new server: '{server_name}'"
-                        )
-                    else:
-                        logger.warning(
-                            f"Failed to connect to new server: '{server_name}'"
-                        )
-
-                except asyncio.CancelledError as e:
-                    logger.error(f"Failed to create server '{server_name}' (cancelled): {e}")
-                    # Rollback on failure
-                    main_app.router.routes = backup_routes
-                    raise
-                except Exception as e:
-                    logger.error(f"Failed to create server '{server_name}': {e}")
-                    # Rollback on failure
-                    main_app.router.routes = backup_routes
-                    raise
-
-        # Update stored config data only after successful reload
+        active = getattr(main_app.state, "active_lifespans", None)
+        if active is None:
+            active = main_app.state.active_lifespans = {}
+        retired = [active.pop(name) for name in removed | changed if name in active]
+        removed_paths = {f"{path_prefix}{name}" for name in removed | changed}
+        # There is no await between publishing routes, lifespans and configuration.
+        main_app.router.routes = [
+            route
+            for route in main_app.router.routes
+            if not (isinstance(route, Mount) and route.path in removed_paths)
+        ] + staged_routes
+        active.update(staged_contexts)
         main_app.state.config_data = new_config_data
+        await asyncio.shield(_retire_lifespans(main_app, retired))
         logger.info("Config reload completed successfully")
-
-    except Exception as e:
-        logger.error(f"Error during config reload, keeping previous configuration: {e}")
-        # Ensure we're back to the original state
-        main_app.router.routes = backup_routes
-        raise
 
 
 async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
@@ -516,7 +606,11 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
     if instructions:
         app.description = instructions
 
-    tools_result = await session.list_tools()
+    tools_result = (
+        await session_manager.run_with_session(session, session.list_tools)
+        if session_manager
+        else await session.list_tools()
+    )
     tools = tools_result.tools
     
     # Filter out disabled tools
@@ -623,29 +717,41 @@ async def lifespan(app: FastAPI):
     api_dependency = getattr(app.state, "api_dependency", None)
     path_prefix = getattr(app.state, "path_prefix", "/")
 
-    # Get shutdown handler from app state
-    shutdown_handler = getattr(app.state, "shutdown_handler", None)
-
     is_main_app = not command and not (
         server_type in ["sse", "streamable-http"] and args
     )
 
     if is_main_app:
-        async with AsyncExitStack() as stack:
+        startup_lock = _get_reload_lock(app)
+        await startup_lock.acquire()
+        startup_locked = True
+        app.state.active_lifespans = {}
+        app.state.shutting_down = False
+        config_watcher = getattr(app.state, "config_watcher", None)
+        try:
+            # Observe edits during slow initial handshakes. Reload callbacks wait
+            # for this startup lock before they can replace any connections.
+            if config_watcher is not None:
+                config_watcher.start()
             successful_servers = []
             failed_servers = []
 
             sub_lifespans = [
-                (route.app, route.app.router.lifespan_context(route.app))
+                (
+                    route.path[len(path_prefix) :],
+                    route.app,
+                    route.app.router.lifespan_context(route.app),
+                )
                 for route in app.routes
                 if isinstance(route, Mount) and isinstance(route.app, FastAPI)
             ]
 
-            for sub_app, lifespan_context in sub_lifespans:
+            for server_id, sub_app, lifespan_context in sub_lifespans:
                 server_name = sub_app.title
                 logger.info(f"Initiating connection for server: '{server_name}'...")
                 try:
-                    await stack.enter_async_context(lifespan_context)
+                    await lifespan_context.__aenter__()
+                    app.state.active_lifespans[server_id] = lifespan_context
                     is_connected = getattr(sub_app.state, "is_connected", False)
                     if is_connected:
                         logger.info(f"Successfully connected to '{server_name}'.")
@@ -655,42 +761,14 @@ async def lifespan(app: FastAPI):
                             f"Connection attempt for '{server_name}' finished, but status is not 'connected'."
                         )
                         failed_servers.append(server_name)
-                except asyncio.CancelledError as e:
-                    if shutdown_handler and shutdown_handler.shutdown_event.is_set():
-                        raise
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
                     logger.error(
-                        f"Failed to establish connection for server: '{server_name}' - CancelledError: {e}",
-                        exc_info=True,
+                        "Failed to establish connection for server '%s' (%s)",
+                        server_name,
+                        type(error).__name__,
                     )
-                    failed_servers.append(server_name)
-                except Exception as e:
-                    error_class_name = type(e).__name__
-                    if error_class_name == "ExceptionGroup" or (
-                        hasattr(e, "exceptions") and hasattr(e, "message")
-                    ):
-                        logger.error(
-                            f"Failed to establish connection for server: '{server_name}' - Multiple errors occurred:"
-                        )
-                        # Log each individual exception from the group
-                        exceptions = getattr(e, "exceptions", [])
-                        for idx, exc in enumerate(exceptions):
-                            logger.error(
-                                f"  Error {idx + 1}: {type(exc).__name__}: {exc}"
-                            )
-                            # Also log traceback for each exception
-                            if hasattr(exc, "__traceback__"):
-                                import traceback
-
-                                tb_lines = traceback.format_exception(
-                                    type(exc), exc, exc.__traceback__
-                                )
-                                for line in tb_lines:
-                                    logger.debug(f"    {line.rstrip()}")
-                    else:
-                        logger.error(
-                            f"Failed to establish connection for server: '{server_name}' - {type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
                     failed_servers.append(server_name)
 
             logger.info("\n--- Server Startup Summary ---")
@@ -711,9 +789,29 @@ async def lifespan(app: FastAPI):
             if not successful_servers:
                 logger.error("No MCP servers could be reached.")
 
+            startup_locked = False
+            startup_lock.release()
             yield
-            # The AsyncExitStack will handle the graceful shutdown of all servers
-            # when the 'with' block is exited.
+        finally:
+            app.state.shutting_down = True
+            staging_reload = getattr(app.state, "staging_reload_task", None)
+            if (
+                staging_reload is not None
+                and staging_reload is not asyncio.current_task()
+            ):
+                # A replacement's handshake must not block shutdown of healthy
+                # connections. Its cancellation path rolls back staged lifespans.
+                staging_reload.cancel()
+            if startup_locked:
+                startup_lock.release()
+            if config_watcher is not None:
+                config_watcher.stop()
+            async with _get_reload_lock(app):
+                contexts = list(app.state.active_lifespans.values())
+                app.state.active_lifespans.clear()
+                _retire_lifespans(app, contexts)
+                pending = list(app.state.retiring_lifespans)
+            await asyncio.shield(asyncio.gather(*pending))
     else:
         # This is a sub-app's lifespan
         app.state.is_connected = False
@@ -732,9 +830,11 @@ async def lifespan(app: FastAPI):
                         storage_type=oauth_config.get("storage_type", "file"),
                     )
                     logger.info(f"OAuth provider created for server: {server_name}")
-                except Exception as e:
+                except Exception as error:
                     logger.error(
-                        f"Failed to create OAuth provider for {server_name}: {e}"
+                        "Failed to create OAuth provider for '%s' (%s)",
+                        server_name,
+                        type(error).__name__,
                     )
                     raise
 
@@ -760,11 +860,11 @@ async def lifespan(app: FastAPI):
             await create_dynamic_endpoints(app, api_dependency=api_dependency)
             app.state.is_connected = True
             yield
-        except Exception as e:
-            # Log the full exception with traceback for debugging
+        except Exception as error:
             logger.error(
-                f"Failed to connect to MCP server '{app.title}': {type(e).__name__}: {e}",
-                exc_info=True,
+                "Failed to connect to MCP server '%s' (%s)",
+                app.title,
+                type(error).__name__,
             )
             app.state.is_connected = False
             # Re-raise the exception so it propagates to the main app's lifespan
@@ -948,7 +1048,7 @@ async def run(
             await reload_config_handler(main_app, new_config)
 
         config_watcher = ConfigWatcher(config_path, reload_callback)
-        config_watcher.start()
+        main_app.state.config_watcher = config_watcher
 
     logger.info("Uvicorn server starting...")
     uvicorn_log_level = log_level.lower()

@@ -1,10 +1,10 @@
 import logging
 import json
-import traceback
 from typing import Any, Dict, ForwardRef, List, Literal, Optional, Type, Union
 
-from anyio import ClosedResourceError
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
 from fastapi import HTTPException, Request
+from httpx import codes
 
 from mcp import types
 from mcp.types import (
@@ -349,140 +349,109 @@ def get_model_fields(form_model_name, properties, required_fields, schema_defs=N
     return model_fields
 
 
+def _is_connection_closed(error: Exception) -> bool:
+    if isinstance(error, (BrokenResourceError, ClosedResourceError, EndOfStream)):
+        return True
+    if isinstance(error, ExceptionGroup):
+        return all(_is_connection_closed(cause) for cause in error.exceptions)
+
+    # Match the SDK's receive-loop and Streamable HTTP 404 errors. Upstream
+    # JSON-RPC errors can carry the same codes with their own messages or data.
+    return (
+        isinstance(error, McpError)
+        and error.error.data is None
+        and (error.error.code, error.error.message)
+        in (
+            (types.CONNECTION_CLOSED, "Connection closed"),
+            (32600, "Session terminated"),
+        )
+    )
+
+
+def _is_request_timeout(error: Exception) -> bool:
+    if isinstance(error, TimeoutError):
+        return True
+    # The SDK raises this McpError while handling its local read TimeoutError.
+    # A JSON-RPC error sent by the server has no such exception context.
+    return (
+        isinstance(error, McpError)
+        and isinstance(error.__context__, TimeoutError)
+        and error.error.code == codes.REQUEST_TIMEOUT
+        and error.error.data is None
+        and error.error.message.startswith(
+            "Timed out while waiting for response to ClientRequest. Waited "
+        )
+        and error.error.message.endswith(" seconds.")
+    )
+
+
 def get_tool_handler(
     endpoint_name,
     form_model_fields,
     response_model_fields=None,
     client_header_forwarding_config=None,
 ):
-    async def call_tool_with_reconnect(
+    async def call_tool_once(
         request: Request, arguments: Dict[str, Any]
     ) -> CallToolResult:
         session_manager = getattr(request.app.state, "session_manager", None)
 
-        async def _invoke(session):
-            return await session.call_tool(endpoint_name, arguments=arguments)
-
-        if session_manager:
+        if session_manager is not None:
             try:
                 session, _ = await session_manager.ensure_initialized()
-            except ClosedResourceError:
+            except Exception as error:
+                if not _is_connection_closed(error):
+                    raise
                 logger.warning(
-                    "Session closed while initializing '%s'; attempting reconnect",
+                    "Session closed while initializing '%s' (%s); attempting reconnect",
                     endpoint_name,
+                    type(error).__name__,
                 )
-                session, _ = await session_manager.reconnect()
-            request.app.state.session = session
+                session, _ = await session_manager.ensure_initialized()
+        else:
+            session = getattr(request.app.state, "session", None)
 
-            try:
-                return await _invoke(session)
-            except ClosedResourceError:
-                logger.warning(
-                    "Session closed during call to '%s'; attempting reconnect",
-                    endpoint_name,
-                )
-                session, _ = await session_manager.reconnect()
-                request.app.state.session = session
-                return await _invoke(session)
-
-        session = getattr(request.app.state, "session", None)
-        if not session:
+        if session is None:
             raise HTTPException(
                 status_code=500,
                 detail={"message": "MCP session is not available"},
             )
 
-        return await _invoke(session)
-
-    if form_model_fields:
-        FormModel = create_model(f"{endpoint_name}_form_model", **form_model_fields)
-        ResponseModel = (
-            create_model(f"{endpoint_name}_response_model", **response_model_fields)
-            if response_model_fields
-            else Any
-        )
-
-        async def tool(
-            form_data: FormModel, request: Request
-        ) -> Union[ResponseModel, Any]:
-            args = form_data.model_dump(exclude_none=True, by_alias=True)
-
-            forwarded_headers = {}
-            if (
-                client_header_forwarding_config
-                and client_header_forwarding_config.get("enabled", False)
-            ):
-                forwarded_headers = process_headers_for_server(
-                    request, client_header_forwarding_config
-                )
-
-            meta = {}
-            if forwarded_headers:
-                meta["headers"] = forwarded_headers
-
-            logger.info(f"Calling endpoint: {endpoint_name}, with args: {args}")
-            try:
-                result = await call_tool_with_reconnect(request, args)
-
-                if result.isError:
-                    error_message = "Unknown tool execution error"
-                    error_data = None
-                    if result.content and isinstance(
-                        result.content[0], types.TextContent
-                    ):
-                        error_message = result.content[0].text
-                    detail = {"message": error_message}
-                    if error_data is not None:
-                        detail["data"] = error_data
-                    raise HTTPException(status_code=500, detail=detail)
-
-                response_data = process_tool_response(result)
-                final_response = (
-                    response_data[0] if len(response_data) == 1 else response_data
-                )
-                return final_response
-
-            except McpError as e:
-                logger.info(
-                    f"MCP Error calling {endpoint_name}: {traceback.format_exc()}"
-                )
-                status_code = MCP_ERROR_TO_HTTP_STATUS.get(e.error.code, 500)
-                raise HTTPException(
-                    status_code=status_code,
-                    detail=(
-                        {"message": e.error.message, "data": e.error.data}
-                        if e.error.data is not None
-                        else {"message": e.error.message}
-                    ),
-                )
-            except Exception as e:
-                logger.info(
-                    f"Unexpected error calling {endpoint_name}: {traceback.format_exc()}"
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail={"message": "Unexpected error", "error": str(e)},
-                )
-
-        return tool
-
-    async def tool(request: Request):
-        forwarded_headers = {}
-        if (
-            client_header_forwarding_config
-            and client_header_forwarding_config.get("enabled", False)
-        ):
-            forwarded_headers = process_headers_for_server(
-                request, client_header_forwarding_config
-            )
-
-        meta = {}
-        if forwarded_headers:
-            meta["headers"] = forwarded_headers
-
-        logger.info(f"Calling endpoint: {endpoint_name}, with no args")
         try:
-            result = await call_tool_with_reconnect(request, {})
+            if session_manager is not None:
+                return await session_manager.run_with_session(
+                    session, session.call_tool, endpoint_name, arguments=arguments
+                )
+            return await session.call_tool(endpoint_name, arguments=arguments)
+        except Exception as error:
+            if not (_is_connection_closed(error) or _is_request_timeout(error)):
+                raise
+            logger.warning(
+                "Session interrupted during call to '%s' (%s)",
+                endpoint_name,
+                type(error).__name__,
+            )
+            if session_manager is not None:
+                await session_manager.invalidate(session)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "tool_execution_unknown",
+                    "message": (
+                        "Tool execution may have completed. Check upstream before retrying."
+                    ),
+                },
+            ) from None
+
+    async def execute_tool(request: Request, arguments: Dict[str, Any]) -> Any:
+        if client_header_forwarding_config and client_header_forwarding_config.get(
+            "enabled", False
+        ):
+            process_headers_for_server(request, client_header_forwarding_config)
+
+        logger.info("Calling endpoint: %s", endpoint_name)
+        try:
+            result = await call_tool_once(request, arguments)
 
             if result.isError:
                 error_message = "Unknown tool execution error"
@@ -497,10 +466,10 @@ def get_tool_handler(
             )
             return final_response
 
+        except HTTPException:
+            raise
         except McpError as e:
-            logger.info(
-                f"MCP Error calling {endpoint_name}: {traceback.format_exc()}"
-            )
+            logger.info("MCP error calling %s (%s)", endpoint_name, type(e).__name__)
             status_code = MCP_ERROR_TO_HTTP_STATUS.get(e.error.code, 500)
             raise HTTPException(
                 status_code=status_code,
@@ -512,11 +481,30 @@ def get_tool_handler(
             )
         except Exception as e:
             logger.info(
-                f"Unexpected error calling {endpoint_name}: {traceback.format_exc()}"
+                "Unexpected error calling %s (%s)", endpoint_name, type(e).__name__
             )
             raise HTTPException(
                 status_code=500,
                 detail={"message": "Unexpected error", "error": str(e)},
             )
+
+    if form_model_fields:
+        FormModel = create_model(f"{endpoint_name}_form_model", **form_model_fields)
+        ResponseModel = (
+            create_model(f"{endpoint_name}_response_model", **response_model_fields)
+            if response_model_fields
+            else Any
+        )
+
+        async def tool(
+            form_data: FormModel, request: Request
+        ) -> Union[ResponseModel, Any]:
+            arguments = form_data.model_dump(exclude_none=True, by_alias=True)
+            return await execute_tool(request, arguments)
+
+        return tool
+
+    async def tool(request: Request):
+        return await execute_tool(request, {})
 
     return tool
